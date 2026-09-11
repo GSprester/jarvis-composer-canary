@@ -2,7 +2,7 @@
 
 One-line description: Disposable public repository for verified Jarvis Composer candidate-import canaries.
 
-Top-level entries observed (`ls -la /workspace`): `.git/`, `artifacts/`, `README.md`.
+Top-level entries observed (`ls -1A /workspace`): `artifacts`, `.git`, `README.md`, `TASK-01-REPORT.md`.
 
 Path existence:
 
