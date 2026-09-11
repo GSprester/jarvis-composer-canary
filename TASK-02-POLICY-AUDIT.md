@@ -4,20 +4,19 @@ No provider-policy or configuration-loading code exists in this repository. Ther
 
 ## Scope actually searched
 
-Checked this checkout for provider-policy and configuration-loading code. The following previously named paths are absent:
+Checked this checkout for provider-policy and configuration-loading code. These paths are absent:
 
 - `cloud_dispatch.py`: does not exist
 - `external_provider_policy.py`: does not exist
 - `scripts/handoff_lifecycle.py`: does not exist
 
-Tracked and observed files in this checkout:
+Observed files (not provider-policy or configuration-loading implementations):
 
 - `README.md`
-- `TASK-01-REPORT.md`
-- `TASK-02-POLICY-AUDIT.md` (this file)
-- `artifacts/` (unrelated local content; not provider-policy or configuration-loading code)
+- `TASK-01-REPORT.md` through `TASK-06-ARTIFACT-CHECK.md`
+- `artifacts/` (local gold-set and reduced-motion notes; no allow/deny policy loader)
 
-No Python/TypeScript/JSON/YAML configuration loaders, policy evaluators, or allow/deny decision functions are present.
+No Python/TypeScript/JSON/YAML configuration loaders, policy evaluators, or allow/deny decision functions are present. Embedded snippets in the TASK notes are documentation, not loaded policy.
 
 ## Early return / raise table
 
