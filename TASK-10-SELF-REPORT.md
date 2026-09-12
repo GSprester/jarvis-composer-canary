@@ -4,14 +4,16 @@ This checkout has no worker runtime. The argument is the evidence rule behind `T
 
 ## Why a worker-written completion record is weaker
 
-A completion **record** is a row the worker can write: `status=completed`, “DONE:”, a receipt JSON it authored. A third-party **check** is someone else (or a later process with no seat memory) confirming that a declared path exists and its bytes hash to a declared digest (`TASK-06-ARTIFACT-CHECK.md`).
+A completion **record** is a row the worker can write: `status=completed`, `DONE:`, a receipt JSON it authored. A third-party **check** is someone else (or a later process with no seat memory) confirming that a declared path exists and its bytes hash to a declared digest (`TASK-06-ARTIFACT-CHECK.md`).
 
 The record and the work share an author. The check and the work do not. After the worker exits, is killed, or is resumed as a new admission (`TASK-05-DOCTRINE-DRAFT.md`), only the bytes remain. A status field does not.
 
 | Signal | Who writes it | Survives worker death | Independently re-runnable |
 |---|---|---|---|
 | Worker `status=completed` | the worker | as a claim only | no — it is the claim |
-| File at path P with sha256 E | the worker may write bytes; **not** the verdict | yes, if the file is still there | yes — any third party runs the checker |
+| File at path P with sha256 E | the worker may write the bytes; **not** the verdict | yes, if the file is still there | yes — any third party runs the checker |
+
+Existence alone is not the check (an empty stub exists). The third party re-reads the bytes.
 
 ## Concrete examples
 
@@ -25,16 +27,16 @@ The record and the work share an author. The check and the work do not. After th
 
 The worker emits a completion record **without** an artifact that a third party can check, or with an artifact that does not match the declared digest.
 
-Forms:
-
-- **Status-only:** `completed` / “DONE:” and no file.
-- **Partial work:** one of three subtasks written; umbrella `completed` anyway.
-- **Wrong bytes:** file exists, hash ≠ declared E (trimmed preview, stale pointer, or a different day’s receipt name).
-- **Out-of-repo path:** worker points at `/tmp/...`; checker refuses; record still says completed.
+| Form | What is written | What a third party finds |
+|---|---|---|
+| Status-only | `completed` / `DONE:` and no file | checker non-zero (missing) |
+| Partial work | one of three subtasks on disk; umbrella `completed` | declared digest does not match |
+| Wrong bytes | file exists; hash ≠ declared E (preview, stale pointer, wrong day’s receipt name) | checker non-zero (mismatch) |
+| Out-of-repo path | pointer at `/tmp/...`; record still says completed | checker refuses; does not hash |
 
 Downstream treats the record as closed work. Resume, reboot sweep, and monthly audit (`TASK-09-RETENTION-RISK.md`) then have nothing to re-hash. The incident looks finished until someone looks for the file.
 
-Discouragement (lint, “please attach a receipt,” honor-system `DONE:`) does not stop a model or a crashed wrapper from writing the bit.
+Lint, “please attach a receipt,” and honor-system `DONE:` do not stop a model or a crashed wrapper from writing the bit. That is discouragement.
 
 ## Design that makes over-claim structurally impossible
 
@@ -50,4 +52,4 @@ else UNVERIFIED
 - If the file is missing, empty-when-not-expected, wrong hash, or outside the repo, the view is UNVERIFIED even if the worker’s last log line said “done.”
 - Over-claim is not a policy violation. There is no cell that can hold the over-claim.
 
-That is stronger than telling the worker not to lie. The store cannot represent a completion the checker has not re-derived.
+That is stronger than telling the worker not to lie. The store cannot represent a completion the checker has not re-derived (`TASK-17-SEPARATION-OF-DUTIES.md`).
