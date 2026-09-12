@@ -1,6 +1,8 @@
 # TASK-06-ARTIFACT-CHECK
 
-Dependency-free checker: exit 0 only when the declared path is inside this repository, the file exists, and its SHA-256 matches the expected digest passed beside it. Anything else is non-zero. This checkout has no job store; the script below is the checker.
+Dependency-free checker. Takes a declared artifact path and an expected SHA-256 passed alongside it. Exits **0** only if the path is a regular file **inside this repository** and `sha256(file bytes)` equals that digest. Anything else is non-zero (UNVERIFIED, not a completion claim).
+
+This checkout has no job store. The script below is the checker. Stdlib only.
 
 ## Usage
 
@@ -16,11 +18,10 @@ Extract the script from the fence that starts `#!/usr/bin/env python3`.
 | Case | Result |
 |---|---|
 | Missing file | non-zero |
-| Empty file, expected digest is SHA-256 of empty bytes | 0 |
-| Empty file, expected digest is some other hash | non-zero |
-| Correct hash of a non-empty file | 0 |
-| Wrong hash of an existing file | non-zero |
-| Path outside the repo (`/tmp/...` or `../...` escape) | non-zero (refuse; do not hash) |
+| Empty file | 0 only if the expected digest is SHA-256 of empty bytes; otherwise non-zero (a stub exists, the hash does not match) |
+| Correct hash | 0 |
+| Wrong hash | non-zero |
+| Path outside the repo (`/tmp/...` or `../...`) | non-zero — **refuse**; do not hash |
 
 ## Checker
 
@@ -33,13 +34,16 @@ Exit 0 only if all of the following hold:
   - the path is an existing regular file
   - sha256(file bytes) equals the expected hex digest
 
-Why artifact existence (plus digest) is a stronger completion signal than a
-worker-written status field: a status bit is authored by the same process that
-wants to be seen as done, so it cannot be audited after the worker is gone or
-if the worker lies. A file at a declared path with a matching sha256 can be
-re-read by a third party who never sat in that seat. Missing, empty-when-not-
-expected, wrong-hash, or out-of-repo paths fail closed (non-zero), which is
-UNVERIFIED rather than a completion claim.
+Why artifact existence is a stronger completion signal than a worker-written
+status field: a status bit is authored by the same process that wants to be
+seen as done. After the worker exits, is killed, or is resumed as a new
+admission, that bit cannot be re-derived by anyone who was not in the seat.
+A file at a declared path can be. Existence alone is not enough (an empty
+stub exists); the third party re-reads the bytes and checks sha256 against
+the digest that was declared beside the path. Missing, empty-when-not-
+expected, wrong-hash, or out-of-repo paths fail closed (non-zero). That is
+UNVERIFIED, not a completion claim. The worker has no write path to COMPLETED
+(TASK-05-DOCTRINE-DRAFT.md, TASK-10-SELF-REPORT.md).
 
 Stdlib only. No network.
 """
@@ -74,12 +78,10 @@ def is_inside(root: Path, path: Path) -> bool:
 def check_artifact(declared: str, expected: str, repo_root: Path) -> int:
     expected = expected.strip().lower()
     if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
-        print("error: expected digest must be 64 lowercase hex characters", file=sys.stderr)
+        print("error: expected digest must be 64 hex characters", file=sys.stderr)
         return 2
 
     raw = Path(declared)
-    # Refuse absolute paths that are not under the repo, and refuse
-    # resolution that escapes via .. or symlinks, before hashing.
     candidate = raw if raw.is_absolute() else (repo_root / raw)
     try:
         resolved = candidate.resolve(strict=False)
@@ -87,6 +89,7 @@ def check_artifact(declared: str, expected: str, repo_root: Path) -> int:
         print(f"error: cannot resolve path: {exc}", file=sys.stderr)
         return 1
 
+    # Refuse escape before any hash. Out-of-repo paths are not artifacts.
     if not is_inside(repo_root, resolved):
         print("error: path is outside the repository; refuse", file=sys.stderr)
         return 1
@@ -112,10 +115,8 @@ def self_test() -> int:
     def expect(name: str, path: str, digest: str, want: int) -> None:
         nonlocal failures
         got = check_artifact(path, digest, repo_root)
-        # Map all failures to boolean non-zero vs zero.
         ok = (got == 0) if want == 0 else (got != 0)
-        status = "PASS" if ok else "FAIL"
-        print(f"{status}: {name} (exit {got}, want {'0' if want == 0 else 'non-zero'})")
+        print(f"{'PASS' if ok else 'FAIL'}: {name} (exit {got}, want {'0' if want == 0 else 'non-zero'})")
         if not ok:
             failures += 1
 
@@ -130,15 +131,20 @@ def self_test() -> int:
         wrong = hashlib.sha256(b"not-the-bytes\n").hexdigest()
 
         expect("missing file", str(missing.relative_to(repo_root)), good, 1)
-        expect("empty file correct hash", str(empty.relative_to(repo_root)), EMPTY_SHA256, 0)
-        expect("empty file wrong hash", str(empty.relative_to(repo_root)), good, 1)
+        expect("empty file (matches empty digest)", str(empty.relative_to(repo_root)), EMPTY_SHA256, 0)
+        expect("empty file (expected other digest)", str(empty.relative_to(repo_root)), good, 1)
         expect("correct hash", str(payload.relative_to(repo_root)), good, 0)
         expect("wrong hash", str(payload.relative_to(repo_root)), wrong, 1)
 
     outside = Path("/tmp/task-06-outside-artifact.bin")
     outside.write_bytes(b"outside\n")
     try:
-        expect("path outside repo (absolute)", str(outside), hashlib.sha256(b"outside\n").hexdigest(), 1)
+        expect(
+            "path outside repo (absolute)",
+            str(outside),
+            hashlib.sha256(b"outside\n").hexdigest(),
+            1,
+        )
     finally:
         outside.unlink(missing_ok=True)
 
@@ -155,8 +161,7 @@ def main(argv: list[str]) -> int:
         print("usage: artifact_check.py <declared-path> <expected-sha256>", file=sys.stderr)
         print("       artifact_check.py --self-test", file=sys.stderr)
         return 2
-    repo_root = find_repo_root(Path.cwd())
-    return check_artifact(argv[1], argv[2], repo_root)
+    return check_artifact(argv[1], argv[2], find_repo_root(Path.cwd()))
 
 
 if __name__ == "__main__":
