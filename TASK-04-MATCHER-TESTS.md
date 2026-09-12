@@ -1,6 +1,8 @@
 # TASK-04-MATCHER-TESTS
 
-This checkout has no receipt-to-handoff matcher implementation. The suite below is the contract. Pairing is by identity (`receipt.re == handoff.name`), not by the `YYYYMMDD-` name prefix. These tests fail against a naive date-prefix matcher.
+This checkout has no receipt-to-handoff matcher implementation. The suite below is the contract. Pairing is by identity (`receipt.re == handoff.name`), not by the `YYYYMMDD-` name prefix.
+
+These tests **fail** if `match` is bound to a naive date-prefix join. They **pass** if `match` is bound to `re`-identity. Do not treat an empty pair list as success: a prefix matcher drops the UTC rollover case and the `re` property is then vacuously true.
 
 ## Matcher contract
 
@@ -8,7 +10,7 @@ This checkout has no receipt-to-handoff matcher implementation. The suite below 
 - A **receipt** has a unique `name` and a `re` field naming exactly one handoff.
 - `match(handoffs, receipts)` returns a list of `(handoff, receipt)` pairs.
 - A pair is valid only when `receipt.re == handoff.name`.
-- Receipt names may use a different UTC calendar date than the handoff they refer to. Date prefixes are not a key.
+- Receipt names may use a different UTC calendar date than the handoff they refer to. Date prefixes are not a key (`TASK-07-DATE-ROLLOVER.md`).
 
 ## Naive matcher these tests reject
 
@@ -28,13 +30,24 @@ def naive_date_prefix_match(handoffs, receipts):
 
 That implementation misses `20260911-*` receipts whose `re` names a `20260910-*` handoff, and can bind a receipt to a same-date handoff that is not `receipt.re`.
 
+## Reference matcher these tests accept
+
+```python
+def identity_match(handoffs, receipts):
+    """Correct: pair only when receipt.re == handoff.name."""
+    by_name = {h.name: h for h in handoffs}
+    return [(by_name[r.re], r) for r in receipts if r.re in by_name]
+```
+
+Point `match` at the implementation under test. `match = naive_date_prefix_match` must fail. `match = identity_match` must pass. `identity_match` is the predicate, not a product matcher to land here.
+
 ## Property-based suite
 
-Requires `hypothesis`. Point `match` at the implementation under test. Pointing it at `naive_date_prefix_match` must fail.
+Requires `hypothesis`.
 
 ```python
 from dataclasses import dataclass
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 
@@ -71,7 +84,9 @@ def worlds(draw):
     for i in range(n_receipts):
         r_date = draw(st.sampled_from(DATES))
         r_slug = draw(st.sampled_from(SLUGS))
-        target = draw(st.sampled_from(handoff_names + [token(draw(st.sampled_from(DATES)), draw(st.sampled_from(SLUGS)))]))
+        target = draw(st.sampled_from(
+            handoff_names + [token(draw(st.sampled_from(DATES)), draw(st.sampled_from(SLUGS)))]
+        ))
         receipts.append(Receipt(name=f"{r_date}-{r_slug}-r{i}", re=target))
     return handoffs, receipts
 
@@ -80,6 +95,24 @@ def pair_key(pairs):
     return {(h.name, r.name, r.re) for h, r in pairs}
 
 
+# Forced cases the prefix matcher gets wrong (do not rely on draws alone).
+ROLLOVER = (
+    [Handoff("20260910-alpha")],
+    [Receipt(name="20260911-alpha-r0", re="20260910-alpha")],
+)
+WRONG_SAME_PREFIX = (
+    [Handoff("20260910-alpha"), Handoff("20260911-beta")],
+    [Receipt(name="20260911-beta-r0", re="20260910-alpha")],
+)
+SHARED_PREFIX = (
+    [Handoff("20260910-alpha"), Handoff("20260910-beta")],
+    [Receipt(name="20260910-gamma-r0", re="20260910-beta")],
+)
+
+
+@example(ROLLOVER)
+@example(WRONG_SAME_PREFIX)
+@example(SHARED_PREFIX)
 @given(worlds())
 @settings(max_examples=80)
 def test_symmetric(world):
@@ -89,6 +122,8 @@ def test_symmetric(world):
     assert forward == reversed_inputs
 
 
+@example(ROLLOVER)
+@example(WRONG_SAME_PREFIX)
 @given(worlds())
 @settings(max_examples=80)
 def test_idempotent(world):
@@ -102,25 +137,33 @@ def test_idempotent(world):
     assert pair_key(match(matched_h, matched_r)) == pair_key(once)
 
 
+@example(ROLLOVER)
+@example(WRONG_SAME_PREFIX)
 @given(worlds())
 @settings(max_examples=80)
 def test_never_returns_receipt_for_different_handoff(world):
     handoffs, receipts = world
     names = {h.name for h in handoffs}
-    for h, r in match(handoffs, receipts):
+    pairs = match(handoffs, receipts)
+    for h, r in pairs:
         assert r.re == h.name
         assert r.re in names
+    # Vacuous pass on [] is not enough: a named target in-set must be returned.
+    present = names
+    for r in receipts:
+        if r.re in present:
+            assert any(h.name == r.re and rec.name == r.name for h, rec in pairs)
 ```
 
 Properties:
 
 1. **Symmetric.** The pair set is independent of input order.
 2. **Idempotent.** `match(H, R)` is stable; matching the already-paired subset returns that same subset.
-3. **`re` identity.** No returned receipt has `re` naming a different handoff than the one it is paired with.
+3. **`re` identity.** No returned receipt has `re` naming a different handoff than the one it is paired with. If `re` names a handoff that is present, that pair must appear (so a prefix miss cannot hide as “no pairs”).
 
 ## UTC date-rollover regression
 
-Handoff named `20260910-*`, receipt named `20260911-*`, `re` pointing at the 20260910 handoff. A correct matcher pairs them. A date-prefix matcher does not.
+Handoff named `20260910-*`, receipt named `20260911-*`, `re` pointing at the 20260910 handoff. A correct matcher pairs them. A date-prefix matcher returns `[]`.
 
 ```python
 def test_utc_date_rollover_receipt_next_day_still_binds():
@@ -136,14 +179,6 @@ def test_utc_date_rollover_same_prefix_wrong_handoff_is_rejected():
     pairs = match([intended, distractor], [receipt])
     assert pairs == [(intended, receipt)]
     assert all(r.re == h.name for h, r in pairs)
-
-
-def test_naive_date_prefix_fails_rollover():
-    """This assertion is the naive matcher’s failure mode; keep it to document the bug."""
-    handoff = Handoff("20260910-alpha")
-    receipt = Receipt(name="20260911-alpha-r0", re="20260910-alpha")
-    naive = naive_date_prefix_match([handoff], [receipt])
-    assert naive == [(handoff, receipt)]  # fails: prefixes 20260910 vs 20260911
 ```
 
 ## Expected naive failures
@@ -152,6 +187,7 @@ def test_naive_date_prefix_fails_rollover():
 |---|---|
 | `test_utc_date_rollover_receipt_next_day_still_binds` | empty pair list (`20260911` ≠ `20260910`) |
 | `test_utc_date_rollover_same_prefix_wrong_handoff_is_rejected` | pairs the receipt with `20260911-beta` |
-| `test_naive_date_prefix_fails_rollover` | empty pair list |
-| `test_never_returns_receipt_for_different_handoff` | same-date prefix, `re` names another handoff |
-| `test_symmetric` / `test_idempotent` | extra or order-dependent pairs when several handoffs share a date prefix |
+| `test_never_returns_receipt_for_different_handoff` `@example(ROLLOVER)` | `[]` while `re` names a present handoff |
+| `test_never_returns_receipt_for_different_handoff` `@example(WRONG_SAME_PREFIX)` | pair with `20260911-beta`, `re` is `20260910-alpha` |
+| `test_symmetric` `@example(SHARED_PREFIX)` | first-wins flips when handoff order reverses |
+| `test_idempotent` | may pass on a wrong pair; do not treat it as sufficient alone |
