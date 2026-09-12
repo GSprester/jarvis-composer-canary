@@ -22,7 +22,7 @@ Extract the script from the fence that starts `#!/usr/bin/env python3`.
 #!/usr/bin/env python3
 """Append-only log: idempotent replay, no visible torn writes.
 
-ORDERING RULE: append the record bytes, then flush (fsync) those bytes,
+ORDERING RULE: write the record bytes, then flush (fsync) those bytes,
 then advance the high-water mark to the new end. Never advance the
 high-water mark before flush. Readers must expose only offsets in
 [0, high_water_mark). Visibility is the mark, not the file length.
@@ -60,13 +60,18 @@ class AppendLog:
     def append(self, event: dict) -> None:
         payload = json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
         record = HEADER.pack(len(payload)) + payload
+
+        # ORDERING RULE (write → flush → high-water mark):
+        # 1. write the framed record into the buffer
+        # 2. flush (durable) those bytes
+        # 3. only then advance hwm
+        # Readers see buf[:hwm]. File length / flushed length is not visibility.
         self.buf.extend(record)
         if self.fail_before_flush:
             raise Crash("crash between write and flush")
         self.flushed = len(self.buf)
         if self.fail_before_hwm:
             raise Crash("crash between flush and high-water mark")
-        # ORDERING RULE (see module docstring): HWM only after flush.
         self.hwm = self.flushed
 
     def visible_bytes(self) -> bytes:
@@ -120,8 +125,11 @@ def self_test() -> int:
     log = AppendLog()
     log.append(e1)
     log.append(e2)
-    once = fold(log.replay())
-    twice = fold(log.replay() + log.replay())
+    first = log.replay()
+    second = log.replay()
+    check("replay is list-identical", first == second)
+    once = fold(first)
+    twice = fold(first + second)
     check("replay twice yields same id set", once == twice)
     check("two distinct ids after double replay", set(twice) == {"evt-1", "evt-2"})
     check("fold is not a bag (len 2 not 4)", len(twice) == 2)
@@ -188,3 +196,5 @@ if __name__ == "__main__":
 | Crash before flush, only `evt-1` visible | readers use file length, not HWM; torn tails leak |
 | Crash before HWM, only `evt-1` visible | visibility tracks flush, not the mark |
 | Wrong-order HWM raises `TornRecord` | the ordering rule is load-bearing, not style |
+
+The named rule in the script is **write → flush → high-water mark**. Readers expose `[0, hwm)` only.
