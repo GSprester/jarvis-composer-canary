@@ -1,12 +1,12 @@
 # TASK-08-WATCHDOG-PATTERN
 
-Reference implementation of a **silent watchdog**: a scheduled script that prints nothing when healthy and speaks only on anomaly. This checkout has no production watchdog; the script below is the pattern.
+Reference implementation of a **silent watchdog**: a scheduled script that prints **nothing** when healthy and speaks only on anomaly. This checkout has no production watchdog; the script below is the pattern.
 
 Rules:
 
 1. **Silence is health.** No stdout/stderr on a successful healthy probe.
-2. **One alert per episode.** An episode is identified by a state fingerprint. Repeat probes with the same fingerprint stay silent after the first speak.
-3. **Probe failure is UNKNOWN, not healthy.** A failed probe must not take the silent path.
+2. **One alert per episode.** An episode is a state fingerprint. Repeat probes with the same fingerprint stay silent after the first speak.
+3. **Probe failure is UNKNOWN, not healthy.** A failed probe must not take the silent-healthy path and must not be mapped to “no news.”
 4. **Never overwrite last-known-good on a failed probe.** LKG updates only after a successful healthy probe.
 
 ## Usage
@@ -22,7 +22,7 @@ Extract the script from the fence that starts `#!/usr/bin/env python3`.
 
 ```python
 #!/usr/bin/env python3
-"""Silent watchdog: speak only on anomaly, once per fingerprint.
+"""Silent watchdog: print nothing when healthy; speak only on anomaly.
 
 A scheduled probe should be quiet when the estate is healthy. Operators
 treat any output as a page. Therefore:
@@ -32,6 +32,10 @@ treat any output as a page. Therefore:
 - probe failure -> UNKNOWN (not healthy): speak if new fingerprint;
   do not write last-known-good
 
+One alert per episode: the fingerprint is sha256(kind + detail). The same
+anomaly or the same UNKNOWN stays silent after the first line. A later
+healthy tick clears the episode so the next fault can speak again.
+
 Stdlib only. No network.
 """
 
@@ -39,8 +43,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import sys
+import tempfile
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -66,14 +73,14 @@ def run_probe(probe: str, detail: str) -> tuple[str, str]:
         return "healthy", detail
     if probe == "anomaly":
         return "anomaly", detail
-    # probe failure, timeout, unreadable target, or explicit unknown
+    # timeout, unreadable target, missing probe, or explicit unknown
     return "unknown", detail or "probe_failed"
 
 
 def tick(state: dict[str, Any], kind: str, detail: str) -> tuple[dict[str, Any], str | None]:
     """Advance watchdog state. Returns (new_state, alert_or_None).
 
-    Prints are the caller's job: None means stay silent.
+    None means stay silent. The caller must not print on None.
     """
     state = {
         "last_alert_fp": state.get("last_alert_fp"),
@@ -85,7 +92,7 @@ def tick(state: dict[str, Any], kind: str, detail: str) -> tuple[dict[str, Any],
         state["last_alert_fp"] = None  # episode closed; next anomaly is new
         return state, None
 
-    # anomaly or unknown: both are speakable episodes, never LKG writes
+    # anomaly or unknown: speakable episodes. Never write LKG.
     fp = fingerprint(kind, detail)
     if state["last_alert_fp"] == fp:
         return state, None
@@ -108,7 +115,10 @@ def main(argv: list[str]) -> int:
     if args.self_test:
         return self_test()
     if args.state is None or args.probe is None:
-        print("usage: silent_watchdog.py --state STATE.json --probe {healthy|anomaly|unknown}", file=sys.stderr)
+        print(
+            "usage: silent_watchdog.py --state STATE.json --probe {healthy|anomaly|unknown}",
+            file=sys.stderr,
+        )
         return 2
 
     kind, detail = run_probe(args.probe, args.detail)
@@ -116,7 +126,7 @@ def main(argv: list[str]) -> int:
     save_state(args.state, state)
     if alert is not None:
         print(alert)
-        return 1 if kind != "healthy" else 0
+        return 1
     return 0
 
 
@@ -161,6 +171,50 @@ def self_test() -> int:
     s7, a7 = tick(s6, "unknown", "probe_failed")
     check("UNKNOWN after recovery is a new episode", a7 is not None)
 
+    # 6. cold-start probe failure must not mint LKG
+    cold, cold_alert = tick({"last_alert_fp": None, "last_known_good": None}, "unknown", "probe_failed")
+    check("cold-start UNKNOWN speaks", cold_alert is not None)
+    check("cold-start UNKNOWN does not mint LKG", cold["last_known_good"] is None)
+
+    # 7. process boundary: healthy prints nothing on stdout and stderr
+    def run_cli(state_path: Path, probe: str, detail: str = "estate") -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(
+                [
+                    "silent_watchdog.py",
+                    "--state",
+                    str(state_path),
+                    "--probe",
+                    probe,
+                    "--detail",
+                    detail,
+                ]
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "STATE.json"
+        code, out, err = run_cli(state_path, "healthy", "ok")
+        check("CLI healthy exit 0", code == 0)
+        check("CLI healthy stdout empty", out == "")
+        check("CLI healthy stderr empty", err == "")
+        lkg = json.loads(state_path.read_text(encoding="utf-8"))["last_known_good"]
+        check("CLI healthy wrote LKG", lkg == {"detail": "ok"})
+
+        code, out, err = run_cli(state_path, "anomaly", "disk-full")
+        check("CLI first anomaly speaks", code == 1 and out.startswith("ANOMALY") and err == "")
+        lkg_after = json.loads(state_path.read_text(encoding="utf-8"))["last_known_good"]
+        check("CLI anomaly left LKG", lkg_after == {"detail": "ok"})
+
+        code, out, err = run_cli(state_path, "anomaly", "disk-full")
+        check("CLI repeat anomaly silent", code == 0 and out == "" and err == "")
+
+        code, out, err = run_cli(state_path, "unknown", "probe_failed")
+        check("CLI UNKNOWN speaks", code == 1 and out.startswith("UNKNOWN") and err == "")
+        lkg_unknown = json.loads(state_path.read_text(encoding="utf-8"))["last_known_good"]
+        check("CLI UNKNOWN did not overwrite LKG", lkg_unknown == {"detail": "ok"})
+
     return 1 if failures else 0
 
 
@@ -175,7 +229,7 @@ if __name__ == "__main__":
 | healthy | none | overwritten with this reading | cleared |
 | anomaly (new fingerprint) | one `ANOMALY` line | unchanged | `last_alert_fp` set |
 | anomaly (same fingerprint) | none | unchanged | unchanged |
-| unknown / probe failure (new fingerprint) | one `UNKNOWN` line | **unchanged** | `last_alert_fp` set |
+| unknown / probe failure (new fingerprint) | one `UNKNOWN` line | **unchanged** (including still `null` on cold start) | `last_alert_fp` set |
 | unknown (same fingerprint) | none | **unchanged** | unchanged |
 
-Exit status: `0` when silent-healthy; `1` when an alert line is printed; `2` on usage error. A scheduler can still treat non-zero as “spoke.”
+Exit status: `0` when silent (healthy, or a repeat fingerprint); `1` when an alert line is printed; `2` on usage error. A scheduler can treat non-zero as “spoke.” Silence on a failed probe is only allowed after that fingerprint has already spoken; it is not health.
