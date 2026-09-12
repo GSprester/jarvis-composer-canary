@@ -11,7 +11,7 @@ python3 policy_parity.py --self-test
 
 Extract the script from the fence that starts `#!/usr/bin/env python3`.
 
-A permission is a string. Sensitivity class is the permission `class:<name>`. The checker reports symmetric difference and, separately, a class-only delta.
+A permission is a string. Sensitivity class is the permission `class:<name>`. The checker reports the symmetric difference and, separately, a class-only delta (same non-class permissions, different `class`).
 
 ## Checker
 
@@ -21,6 +21,9 @@ A permission is a string. Sensitivity class is the permission `class:<name>`. Th
 
 Exit 0 if the permission sets are identical. Exit 1 if they differ.
 Exit 2 on usage or missing keys. Stdlib only. No network.
+
+Missing `class` raises. Two nameless stubs must not report equal
+(TASK-02-POLICY-AUDIT.md: that path was fail-open).
 """
 
 from __future__ import annotations
@@ -31,10 +34,11 @@ import sys
 from pathlib import Path
 
 
-def permissions_of(entry: dict) -> set[str]:
+def permissions_of(entry: dict, name: str) -> set[str]:
+    if "class" not in entry or entry["class"] in (None, ""):
+        raise KeyError("missing class on provider " + name)
     perms = set(entry.get("permissions") or [])
-    if "class" in entry:
-        perms.add("class:" + str(entry["class"]))
+    perms.add("class:" + str(entry["class"]))
     return perms
 
 
@@ -43,19 +47,20 @@ def diff_providers(policy: dict, left_name: str, right_name: str) -> dict:
     if left_name not in providers or right_name not in providers:
         missing = [n for n in (left_name, right_name) if n not in providers]
         raise KeyError("missing provider entries: " + ", ".join(missing))
-    left = permissions_of(providers[left_name])
-    right = permissions_of(providers[right_name])
+    left = permissions_of(providers[left_name], left_name)
+    right = permissions_of(providers[right_name], right_name)
     only_left = sorted(left - right)
     only_right = sorted(right - left)
     class_left = {p for p in left if p.startswith("class:")}
     class_right = {p for p in right if p.startswith("class:")}
+    non_class_same = (left - class_left) == (right - class_right)
     return {
         "left": left_name,
         "right": right_name,
         "only_left": only_left,
         "only_right": only_right,
-        "class_only_delta": sorted((class_left ^ class_right))
-        if (left - class_left) == (right - class_right) and class_left != class_right
+        "class_only_delta": sorted(class_left ^ class_right)
+        if non_class_same and class_left != class_right
         else [],
         "equal": left == right,
     }
@@ -100,13 +105,28 @@ def self_test() -> int:
     }
     same = diff_providers(policy, "alpha", "gamma")
     check("identical entries are equal", same["equal"] is True)
+    check("identical class_only_delta empty", same["class_only_delta"] == [])
 
     report = diff_providers(policy, "alpha", "beta")
     check("one-class pair is not equal", report["equal"] is False)
     check("only_left is class:internal", report["only_left"] == ["class:internal"])
     check("only_right is class:restricted", report["only_right"] == ["class:restricted"])
-    check("class_only_delta names both classes", report["class_only_delta"] == ["class:internal", "class:restricted"])
-    check("no non-class permission drift", set(report["only_left"] + report["only_right"]) == {"class:internal", "class:restricted"})
+    check(
+        "class_only_delta names both classes",
+        report["class_only_delta"] == ["class:internal", "class:restricted"],
+    )
+    check(
+        "no non-class permission drift",
+        set(report["only_left"] + report["only_right"]) == {"class:internal", "class:restricted"},
+    )
+
+    missing_class = {"providers": {"alpha": {"permissions": ["read"]}, "beta": {"class": "internal"}}}
+    raised = False
+    try:
+        diff_providers(missing_class, "alpha", "beta")
+    except KeyError:
+        raised = True
+    check("missing class raises, not equal", raised)
     return 1 if failures else 0
 
 
@@ -146,13 +166,16 @@ python3 policy_parity.py --policy example.json --left alpha --right beta
 
 Policy keyed by **provider name** (`alpha`, `beta`) attaches the permission set to the vendor bucket, not to the **model** the seat admitted (`helix-7-small`, `helix-7-large`).
 
-A seat’s declared ceiling is a model-level promise: this admission may handle up to `class:internal`. Failover is usually implemented as “try the other provider.” The lookup key becomes `beta`. `beta` is one class higher. No new writer admission runs (`TASK-05-DOCTRINE-DRAFT.md` says resume/failover must take the same admission as a cold start). The seat keeps its old identity and picks up `restricted` because that is what the name `beta` maps to.
+A seat’s declared ceiling is a model-level promise: this admission may handle up to `class:internal`. Failover is usually “try the other provider.” The lookup key becomes `beta`. `beta` is one class higher. No new writer admission runs (`TASK-05-DOCTRINE-DRAFT.md`: failover must take the same admission as a cold start). The seat keeps its old identity and picks up `restricted` because that is what the name `beta` maps to.
 
-The exceed is silent:
+| | After admit on `alpha` | After failover `alpha` → `beta` |
+|---|---|---|
+| Seat object | `ceiling=internal`, model `helix-7-small` | unchanged |
+| Policy key | `alpha` | `beta` |
+| Provider `class` | `internal` | `restricted` |
+| Name-keyed effective class | `internal` | **`restricted` (silent exceed)** |
+| Model-keyed effective class | `internal` | `internal` (model did not change) |
 
-- The seat object still says `ceiling=internal`.
-- The provider entry that is now in force says `class:restricted`.
-- Nothing in a name-keyed table asks whether `beta`’s class is ≤ the seat’s ceiling.
-- A model-keyed table (`helix-7-small` → `internal` on any provider) would deny the path, or require a fresh admission, because the model did not change its ceiling when the vendor did.
+The exceed is silent: the seat still says `ceiling=internal`; the in-force provider says `class:restricted`; nothing in a name-keyed table asks whether `beta`’s class is ≤ the seat’s ceiling. A model-keyed table (`helix-7-small` → `internal` on any vendor) would deny the hop, or require a fresh admission, because the model did not raise its ceiling when the vendor name changed.
 
-Checker output above is the diff a failover wrapper should run **before** switching names. If `class_only_delta` is non-empty and the right-hand class is above the seat ceiling, refuse. Do not treat “same provider family” as “same permissions.”
+Run this checker **before** switching names. If `class_only_delta` is non-empty and the right-hand class is above `seat.ceiling`, refuse (`TASK-13-FAILOVER-CEILING.md`). Do not treat “same provider family” as “same permissions.”
